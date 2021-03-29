@@ -80,6 +80,22 @@ impl<T> Pool<T> {
     }
 
     #[inline]
+    pub fn try_new<F, E>(cap: usize, init: F) -> Result<Pool<T>, E>
+    where
+        F: Fn() -> Result<T, E>,
+    {
+        let mut objects = Stack::new();
+
+        for _ in 0..cap {
+            objects.push(init()?);
+        }
+
+        Ok(Pool {
+            objects: Mutex::new(objects),
+        })
+    }
+
+    #[inline]
     pub fn len(&self) -> usize {
         self.objects.lock().len()
     }
