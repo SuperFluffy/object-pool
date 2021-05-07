@@ -1,127 +1,256 @@
-//! A thread-safe object pool with automatic return and attach/detach semantics
-//!
-//! The goal of an object pool is to reuse expensive to allocate objects or frequently allocated objects
-//!
-//! # Examples
-//!
-//! ## Creating a Pool
-//!
-//! The general pool creation looks like this
-//! ```
-//!  let pool: Pool<T> = Pool::new(capacity, || T::new());
-//! ```
-//! Example pool with 32 `Vec<u8>` with capacity of 4096
-//! ```
-//!  let pool: Pool<Vec<u8>> = Pool::new(32, || Vec::with_capacity(4096));
-//! ```
-//!
-//! ## Using a Pool
-//!
-//! Basic usage for pulling from the pool
-//! ```
-//! let pool: Pool<Vec<u8>> = Pool::new(32, || Vec::with_capacity(4096));
-//! let mut reusable_buff = pool.pull().unwrap(); // returns None when the pool is saturated
-//! reusable_buff.clear(); // clear the buff before using
-//! some_file.read_to_end(reusable_buff);
-//! // reusable_buff is automatically returned to the pool when it goes out of scope
-//! ```
-//! Pull from pool and `detach()`
-//! ```
-//! let pool: Pool<Vec<u8>> = Pool::new(32, || Vec::with_capacity(4096));
-//! let mut reusable_buff = pool.pull().unwrap(); // returns None when the pool is saturated
-//! reusable_buff.clear(); // clear the buff before using
-//! let (pool, reusable_buff) = reusable_buff.detach();
-//! let mut s = String::from(reusable_buff);
-//! s.push_str("hello, world!");
-//! pool.attach(s.into_bytes()); // reattach the buffer before reusable goes out of scope
-//! // reusable_buff is automatically returned to the pool when it goes out of scope
-//! ```
-//!
-//! ## Using Across Threads
-//!
-//! You simply wrap the pool in a [`std::sync::Arc`]
-//! ```
-//! let pool: Arc<Pool<T>> = Arc::new(Pool::new(cap, || T::new()));
-//! ```
-//!
-//! # Warning
-//!
-//! Objects in the pool are not automatically reset, they are returned but NOT reset
-//! You may want to call `object.reset()` or  `object.clear()`
-//! or any other equivalent for the object that you are using, after pulling from the pool
-//!
-//! [`std::sync::Arc`]: https://doc.rust-lang.org/stable/std/sync/struct.Arc.html
-
-use parking_lot::Mutex;
-use std::mem::{ManuallyDrop, forget};
-use std::ops::{Deref, DerefMut};
-
-pub type Stack<T> = Vec<T>;
+use parking_lot::{
+    Condvar,
+    Mutex,
+};
+use std::{
+    mem::{
+        ManuallyDrop,
+        forget
+    },
+    ops::{
+        Deref,
+        DerefMut,
+    },
+    sync::atomic::{
+        AtomicUsize,
+        Ordering,
+    },
+};
 
 pub struct Pool<T> {
-    objects: Mutex<Stack<T>>,
+    objects: Mutex<Vec<T>>,
+    object_available: Condvar,
+    n_live_objects: AtomicUsize,
+    max_capacity: usize,
 }
 
 impl<T> Pool<T> {
-    #[inline]
-    pub fn new<F>(cap: usize, init: F) -> Pool<T>
+    // Associates an object with the pool without immediately pushing into it, but returning
+    // the object immediately wrapped in a `Reusable` so that it gets pushed into the pool once
+    // it goes out of scope.
+    pub fn associate(&self, object: T) -> Result<(usize, Reusable<'_, T>), T> {
+        let mut n_live_objects = self.n_live_objects.load(Ordering::Relaxed);
+        n_live_objects = loop {
+            if n_live_objects >= self.max_capacity {
+                return Err(object);
+            }
+            let one_more_object = n_live_objects + 1;
+            match self.n_live_objects.compare_exchange_weak(
+                n_live_objects,
+                one_more_object,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break one_more_object,
+                Err(x) => n_live_objects = x,
+            }
+        };
+        Ok((n_live_objects, Reusable::new(self, object)))
+    }
+
+    pub fn associate_with<F>(&self, f: F) -> Option<(usize, Reusable<'_, T>)>
     where
         F: Fn() -> T,
     {
-        let mut objects = Stack::new();
-
-        for _ in 0..cap {
-            objects.push(init());
-        }
-
-        Pool {
-            objects: Mutex::new(objects),
-        }
+        let mut n_live_objects = self.n_live_objects.load(Ordering::Relaxed);
+        n_live_objects = loop {
+            if n_live_objects >= self.max_capacity {
+                return None;
+            }
+            let one_more_object = n_live_objects + 1;
+            match self.n_live_objects.compare_exchange_weak(
+                n_live_objects,
+                one_more_object,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break one_more_object,
+                Err(x) => n_live_objects = x,
+            }
+        };
+        let object = f();
+        Some((n_live_objects, Reusable::new(self, object)))
     }
 
-    #[inline]
-    pub fn try_new<F, E>(cap: usize, init: F) -> Result<Pool<T>, E>
+    pub fn try_associate_with<E, F>(&self, f: F) -> Result<Option<(usize, Reusable<'_, T>)>, E>
     where
         F: Fn() -> Result<T, E>,
     {
-        let mut objects = Stack::new();
-
-        for _ in 0..cap {
-            objects.push(init()?);
-        }
-
-        Ok(Pool {
-            objects: Mutex::new(objects),
-        })
+        let mut n_live_objects = self.n_live_objects.load(Ordering::Relaxed);
+        n_live_objects = loop {
+            if n_live_objects >= self.max_capacity {
+                return Ok(None);
+            }
+            let one_more_object = n_live_objects + 1;
+            match self.n_live_objects.compare_exchange_weak(
+                n_live_objects,
+                one_more_object,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break one_more_object,
+                Err(x) => n_live_objects = x,
+            }
+        };
+        let object = f()?;
+        Ok(Some((n_live_objects, Reusable::new(self, object))))
     }
 
-    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.objects.lock().capacity()
+    }
+
     pub fn len(&self) -> usize {
         self.objects.lock().len()
     }
 
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.objects.lock().is_empty()
+    pub fn new(max_capacity: usize) -> Self {
+        Self {
+            objects: Mutex::new(Vec::with_capacity(max_capacity)),
+            object_available: Condvar::new(),
+            n_live_objects: AtomicUsize::new(0),
+            max_capacity, 
+        }
     }
 
-    #[inline]
-    pub fn try_pull(&self) -> Option<Reusable<T>> {
-        self.objects
-            .lock()
-            .pop()
-            .map(|data| Reusable::new(self, data))
+    fn attach(&self, object: T) {
+        let mut object_lock = self.objects.lock();
+        object_lock.push(object);
+        self.object_available.notify_one();
     }
 
-    #[inline]
-    pub fn pull<F: Fn() -> T>(&self, fallback: F) -> Reusable<T> {
-        self.try_pull()
-            .unwrap_or_else(|| Reusable::new(self, fallback()))
+    /// Push an object into the pool. Returns the number of live objects in the pool in ok position
+    /// if the object was successfully pushed into the pool, and otherwise the object in error
+    /// position if the pool was at max capacity.
+    pub fn push(&self, object: T) -> Result<usize, T> {
+        let mut n_live_objects = self.n_live_objects.load(Ordering::Relaxed);
+        n_live_objects = loop {
+            if n_live_objects >= self.max_capacity {
+                return Err(object);
+            }
+            let one_more_object = n_live_objects + 1;
+            match self.n_live_objects.compare_exchange_weak(
+                n_live_objects,
+                one_more_object,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break one_more_object,
+                Err(x) => n_live_objects = x,
+            }
+        };
+        let mut object_lock = self.objects.lock();
+        object_lock.push(object);
+        self.object_available.notify_one();
+        Ok(n_live_objects)
     }
 
-    #[inline]
-    pub fn attach(&self, t: T) {
-        self.objects.lock().push(t)
+    /// Constructs an object `T` using a closure if the object pool is not at capacity, and pushes
+    /// it into the pool. Returns the number of live objects if the object was successfully pushed
+    /// into the pool, and `None` otherwise.
+    pub fn push_with<F>(&self, f: F) -> Option<usize>
+    where
+        F: Fn() -> T,
+    {
+        let mut n_live_objects = self.n_live_objects.load(Ordering::Relaxed);
+        n_live_objects = loop {
+            if n_live_objects >= self.max_capacity {
+                return None;
+            }
+            let one_more_object = n_live_objects + 1;
+            match self.n_live_objects.compare_exchange_weak(
+                n_live_objects,
+                one_more_object,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break one_more_object,
+                Err(x) => n_live_objects = x,
+            }
+        };
+        let object = f();
+        let mut object_lock = self.objects.lock();
+        object_lock.push(object);
+        self.object_available.notify_one();
+        Some(n_live_objects)
+    }
+
+    /// Constructs an object `T` using a fallible closure if the object pool is not at capacity,
+    /// and pushes it into the pool. Returns in ok position the number of live objects if the push
+    /// was successful or `None` if the pool was at capacity, and the error `E` from the closure if
+    /// constructing the object failed.
+    pub fn try_push_with<F, E>(&self, f: F) -> Result<Option<usize>, E>
+    where
+        F: Fn() -> Result<T, E>,
+    {
+        let mut n_live_objects = self.n_live_objects.load(Ordering::Relaxed);
+        n_live_objects = loop {
+            if n_live_objects >= self.max_capacity {
+                return Ok(None);
+            }
+            let one_more_object = n_live_objects + 1;
+            match self.n_live_objects.compare_exchange_weak(
+                n_live_objects,
+                one_more_object,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break one_more_object,
+                Err(x) => n_live_objects = x,
+            }
+        };
+        let object = match f() {
+            Ok(object) => object,
+            Err(e) => {
+                self.n_live_objects.fetch_sub(1, Ordering::Release);
+                return Err(e);
+            }
+        };
+        let mut object_lock = self.objects.lock();
+        object_lock.push(object);
+        self.object_available.notify_one();
+        Ok(Some(n_live_objects))
+    }
+
+    /// Pull an object from the pool. Blocks the current thread until it's notified that another
+    /// object is available to be pulled.
+    pub fn pull(&self) -> Reusable<'_, T> {
+        let mut objects_lock = self.objects.lock();
+        while objects_lock.is_empty() {
+            self.object_available.wait(&mut objects_lock);
+        }
+        objects_lock.pop().map(|object| Reusable::new(self, object)).unwrap()
+    }
+
+    /// Pull an object from the pool. Constructs a new object from the supplied closure if no
+    /// object is currently available in the pool and if the pool is not yet at capacity.
+    pub fn pull_or(&self, object: T) -> Result<Reusable<'_, T>, T> {
+        // Attempt to pull an object from the pool; if this failed, construct a new object if
+        // the pool is not yet at capacity. Otherwise wait until a new object is available.
+        match self.objects.lock().pop().map(|object| Reusable::new(self, object)) {
+            None => match self.associate(object) {
+                Ok((_, reusable_object)) => Ok(reusable_object),
+                Err(_) => Ok(self.pull()),
+            }
+            Some(object) => Ok(object),
+        }
+    }
+
+    /// Pull an object from the pool. Constructs a new object from the supplied closure if no
+    /// object is currently available in the pool and if the pool is not yet at capacity.
+    pub fn pull_or_else<F>(&self, f: F) -> Reusable<'_, T>
+    where
+        F: Fn() -> T,
+    {
+        // Attempt to pull an object from the pool; if this failed, construct a new object if
+        // the pool is not yet at capacity. Otherwise wait until a new object is available.
+        match self.objects.lock().pop().map(|object| Reusable::new(self, object)) {
+            None => match self.associate_with(f) {
+                Some((_, reusable_object)) => reusable_object,
+                None => self.pull(),
+            }
+            Some(object) => object,
+        }
     }
 }
 
@@ -131,106 +260,107 @@ pub struct Reusable<'a, T> {
 }
 
 impl<'a, T> Reusable<'a, T> {
-    #[inline]
-    pub fn new(pool: &'a Pool<T>, t: T) -> Self {
+    fn new(pool: &'a Pool<T>, t: T) -> Self {
         Self {
             pool,
             data: ManuallyDrop::new(t),
         }
     }
 
-    #[inline]
-    pub fn detach(mut self) -> (&'a Pool<T>, T) {
-        let ret = unsafe { (self.pool, self.take()) };
+    pub fn detach(mut self) -> T {
+        let (pool, object) = (self.pool, unsafe { ManuallyDrop::take(&mut self.data) });
+        pool.n_live_objects.fetch_sub(1, Ordering::Relaxed);
         forget(self);
-        ret
-    }
-
-    unsafe fn take(&mut self) -> T {
-        ManuallyDrop::take(&mut self.data)
+        object
     }
 }
 
 impl<'a, T> Deref for Reusable<'a, T> {
     type Target = T;
 
-    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.data
     }
 }
 
 impl<'a, T> DerefMut for Reusable<'a, T> {
-    #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.data
     }
 }
 
 impl<'a, T> Drop for Reusable<'a, T> {
-    #[inline]
     fn drop(&mut self) {
-        unsafe { self.pool.attach(self.take()) }
+        let inner = unsafe { ManuallyDrop::take(&mut self.data) };
+        self.pool.attach(inner);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{Pool, Reusable};
-    use std::mem::drop;
+    // use crate::{Pool, Reusable};
+    // use std::mem::drop;
+    use crate::Pool;
 
     #[test]
     fn detach() {
-        let pool = Pool::new(1, || Vec::new());
-        let (pool, mut object) = pool.try_pull().unwrap().detach();
+        let pool: Pool<Vec<usize>> = Pool::new(1);
+        assert!(pool.push(Vec::new()).is_ok());
+        let mut object = pool.pull().detach();
         object.push(1);
-        Reusable::new(&pool, object);
-        assert_eq!(pool.try_pull().unwrap()[0], 1);
+        assert!(pool.push(object).is_ok());
+        assert_eq!(pool.pull()[0], 1);
     }
 
-    #[test]
-    fn detach_then_attach() {
-        let pool = Pool::new(1, || Vec::new());
-        let (pool, mut object) = pool.try_pull().unwrap().detach();
-        object.push(1);
-        pool.attach(object);
-        assert_eq!(pool.try_pull().unwrap()[0], 1);
-    }
+    // #[test]
+    // fn detach_then_attach() {
+    //     let pool = Pool::new();
+    //     pool.push(Vec::new());
+    //     let (pool, mut object) = pool.try_pull().unwrap().detach();
+    //     object.push(1);
+    //     pool.attach(object);
+    //     assert_eq!(pool.try_pull().unwrap()[0], 1);
+    // }
 
-    #[test]
-    fn pull() {
-        let pool = Pool::<Vec<u8>>::new(1, || Vec::new());
+    // #[test]
+    // fn pull() {
+    //     // let pool = Pool::<Vec<u8>>::new(1, || Vec::new());
+    //     let pool: Pool<Vec<u8>> = Pool::new(8);
+    //     pool.push(Vec::new());
 
-        let object1 = pool.try_pull();
-        let object2 = pool.try_pull();
-        let object3 = pool.pull(|| Vec::new());
+    //     let object1 = pool.try_pull();
+    //     let object2 = pool.try_pull();
+    //     let object3 = pool.pull(|| Vec::new());
 
-        assert!(object1.is_some());
-        assert!(object2.is_none());
-        drop(object1);
-        drop(object2);
-        drop(object3);
-        assert_eq!(pool.len(), 2);
-    }
+    //     assert!(object1.is_some());
+    //     assert!(object2.is_none());
+    //     drop(object1);
+    //     drop(object2);
+    //     drop(object3);
+    //     assert_eq!(pool.len(), 2);
+    // }
 
-    #[test]
-    fn e2e() {
-        let pool = Pool::new(10, || Vec::new());
-        let mut objects = Vec::new();
+    // #[test]
+    // fn e2e() {
+    //     let pool = Pool::new();
+    //     for _ in 0..10 {
+    //         pool.push_with(|| Vec::new());
+    //     }
+    //     let mut objects = Vec::new();
 
-        for i in 0..10 {
-            let mut object = pool.try_pull().unwrap();
-            object.push(i);
-            objects.push(object);
-        }
+    //     for i in 0..10 {
+    //         let mut object = pool.try_pull().unwrap();
+    //         object.push(i);
+    //         objects.push(object);
+    //     }
 
-        assert!(pool.try_pull().is_none());
-        drop(objects);
-        assert!(pool.try_pull().is_some());
+    //     assert!(pool.try_pull().is_none());
+    //     drop(objects);
+    //     assert!(pool.try_pull().is_some());
 
-        for i in 10..0 {
-            let mut object = pool.objects.lock().pop().unwrap();
-            assert_eq!(object.pop(), Some(i));
-        }
-    }
+    //     for i in 10..0 {
+    //         let mut object = pool.objects.lock().pop().unwrap();
+    //         assert_eq!(object.pop(), Some(i));
+    //     }
+    // }
 }
