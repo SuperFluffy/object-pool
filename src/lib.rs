@@ -293,6 +293,36 @@ impl<T> Pool<T> {
             object @ Some(_) => object,
         }
     }
+
+    pub fn try_pull_or_else<E, F>(&self, f: F) -> Result<Reusable<'_, T>, E>
+    where
+        F: Fn() -> Result<T, E>,
+    {
+        // Attempt to pull an object from the pool; if this failed, construct a new object if
+        // the pool is not yet at capacity. Otherwise wait until a new object is available.
+        match self.objects.lock().pop_front().map(|object| Reusable::new(self, object)) {
+            None => match self.try_associate_with(f)? {
+                Some((_, reusable_object)) => Ok(reusable_object),
+                None => Ok(self.pull()),
+            }
+            Some(object) => Ok(object),
+        }
+    }
+
+    pub fn try_pull_or_else_once<E, F>(&self, f: F) -> Result<Option<Reusable<'_, T>>, E>
+    where
+        F: Fn() -> Result<T, E>,
+    {
+        // Attempt to pull an object from the pool; if this failed, construct a new object if
+        // the pool is not yet at capacity. Otherwise wait until a new object is available.
+        match self.objects.lock().pop_front().map(|object| Reusable::new(self, object)) {
+            None => match self.try_associate_with(f)? {
+                Some((_, reusable_object)) => Ok(Some(reusable_object)),
+                None => Ok(None),
+            }
+            object @ Some(_) => Ok(object),
+        }
+    }
 }
 
 pub struct Reusable<'a, T> {
